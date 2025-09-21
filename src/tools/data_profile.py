@@ -16,9 +16,9 @@ tool_spec = {
         "type": "object",
         "properties": {
             "path": {"type": "string"},
-            "sep": {"type": "string"},               # para CSV (opcional)
-            "sheet": {"type": "string"},             # para Excel (opcional)
-            "limit_rows": {"type": "integer"},       # límite de filas a leer (por defecto 100k)
+            "sep": {"type": "string"},               # para CSV 
+            "sheet": {"type": "string"},             # para Excel 
+            "limit_rows": {"type": "integer"},       # límite de filas a leer 
             "columns": {"type": "array", "items": {"type": "string"}},
             "encoding": {"type": "string"}           # encoding CSV; default utf-8
         },
