@@ -8,3 +8,8 @@ orjson==3.10.7         # JSON rápido
 openai>=1.51.0
 python-dotenv>=1.0.1
 weasyprint>=61.2
+streamlit>=1.36
+mcp>=1.0.0
+starlette>=0.48
+uvicorn[standard]>=0.31
+pydantic>=2.7

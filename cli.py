@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # cli.py — Chatbot anfitrión con contexto usando tu servidor MCP local
-#           + puente opcional a Filesystem MCP (FS_MCP_CMD) y Git MCP (GIT_MCP_CMD)
+#           + puente opcional a Filesystem MCP (FS_MCP_CMD), Git MCP (GIT_MCP_CMD)
+#           + Peer genérico (PEER1_MCP_CMD / PEER1_MCP_CWD)
 
 import os
 import sys
@@ -36,7 +37,7 @@ def rpc_call(proc, method: str, params: dict | None = None, mid: int = 1):
 def call_tool(proc, name: str, args: dict, mid: int):
     return rpc_call(proc, "tools/call", {"name": name, "args": args}, mid)
 
-# -------------------- Adaptador MCP externo (FS/Git) --------------------
+# -------------------- Adaptador MCP externo (FS/Git/Peer) --------------------
 from src.util.mcp_process import MCPProcess  # requiere src/util/mcp_process.py
 
 # -------------------- Conversación --------------------
@@ -82,6 +83,11 @@ HELP = """Comandos:
   /git.list            Lista las tools del Git MCP
   /git.call NAME {json}Llama una tool del Git MCP
   /git.rpc {json}      RPC crudo al Git MCP
+
+  # Peer1 genérico (si PEER1_MCP_CMD está definido)
+  /peer1.list          Lista tools del peer
+  /peer1.call NAME {json}
+  /peer1.rpc {json}
 
   /exit                Salir
 
@@ -139,6 +145,20 @@ def main():
         except Exception as e:
             print(f"⚠️  Git MCP no inicializó: {e}")
             git = None
+
+    # Arrancar Peer1 MCP genérico si PEER1_MCP_CMD está definido
+    peer1_cmd = os.getenv("PEER1_MCP_CMD")
+    peer1_cwd = os.getenv("PEER1_MCP_CWD", str(PROJ_ROOT))
+    peer1: Optional[MCPProcess] = None
+    if peer1_cmd:
+        try:
+            peer1 = MCPProcess(peer1_cmd, cwd=peer1_cwd, env=os.environ).start()
+            peer1.initialize()
+            names = [t["name"] for t in peer1.tools_list()]
+            print(f"🤝 Peer1 MCP listo: {', '.join(names) or '(sin tools?)'}")
+        except Exception as e:
+            print(f"⚠️  Peer1 MCP no inicializó: {e}")
+            peer1 = None
 
     # Config “suave” por entorno
     default_temp = float(os.getenv("LLM_TEMPERATURE", "0.1"))
@@ -309,6 +329,59 @@ def main():
                         print(orjson.dumps(res, option=orjson.OPT_INDENT_2).decode())
                     except Exception as e:
                         print(f"[git.rpc error] {e}")
+                    continue
+
+                # ----- Peer1 genérico -----
+                if cmd == "/peer1.list":
+                    if not peer1:
+                        print("Peer1 no está configurado (PEER1_MCP_CMD).")
+                        continue
+                    try:
+                        tools = peer1.tools_list()
+                        print("🤝  Peer1 tools:", ", ".join(t["name"] for t in tools))
+                    except Exception as e:
+                        print(f"[peer1.list error] {e}")
+                    continue
+
+                if cmd == "/peer1.call":
+                    if not peer1:
+                        print("Peer1 no está configurado (PEER1_MCP_CMD).")
+                        continue
+                    if len(parts) < 3:
+                        print("Uso: /peer1.call NAME {json_args}")
+                        continue
+                    name = parts[1]
+                    try:
+                        args = json.loads(parts[2])
+                    except Exception as e:
+                        print(f"JSON inválido: {e}")
+                        continue
+                    try:
+                        result = peer1.tools_call(name, args)
+                        print(orjson.dumps(result, option=orjson.OPT_INDENT_2).decode())
+                    except Exception as e:
+                        print(f"[peer1.call error] {e}")
+                    continue
+
+                if cmd == "/peer1.rpc":
+                    if not peer1:
+                        print("Peer1 no está configurado (PEER1_MCP_CMD).")
+                        continue
+                    if len(parts) < 2:
+                        print('Uso: /peer1.rpc {"method":"tools/list"}')
+                        continue
+                    try:
+                        payload = json.loads(parts[1])
+                    except Exception as e:
+                        print(f"JSON inválido: {e}")
+                        continue
+                    try:
+                        m = payload.get("method")
+                        params = payload.get("params")
+                        res = peer1.rpc_call(m, params)
+                        print(orjson.dumps(res, option=orjson.OPT_INDENT_2).decode())
+                    except Exception as e:
+                        print(f"[peer1.rpc error] {e}")
                     continue
 
                 print("Comando no reconocido. /help para ayuda.")
