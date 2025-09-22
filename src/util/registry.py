@@ -70,7 +70,8 @@ def build_registry() -> ToolRegistry:
         "src.tools.data_profile",
         "src.tools.ts_forecast",
         "src.tools.report_generate",
-        "src.tools.llm_chat",        # ← NUEVO (Llama vía Ollama)
+        "src.tools.llm_chat",              # Llama vía Ollama
+        "src.tools.project_scaffold",      # registrar scaffold
     ]
 
     for modname in module_names:

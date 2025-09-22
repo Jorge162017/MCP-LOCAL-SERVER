@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # cli.py — Chatbot anfitrión con contexto usando tu servidor MCP local
+#           + puente opcional a Filesystem MCP (FS_MCP_CMD) y Git MCP (GIT_MCP_CMD)
+
 import os
 import sys
 import json
@@ -7,11 +9,11 @@ import time
 import orjson
 import subprocess
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 PROJ_ROOT = Path(__file__).resolve().parent
 
-# -------------------- JSON-RPC helpers --------------------
+# -------------------- JSON-RPC helpers (server local) --------------------
 def _send(proc, payload: dict):
     proc.stdin.write(orjson.dumps(payload) + b"\n")
     proc.stdin.flush()
@@ -34,24 +36,20 @@ def rpc_call(proc, method: str, params: dict | None = None, mid: int = 1):
 def call_tool(proc, name: str, args: dict, mid: int):
     return rpc_call(proc, "tools/call", {"name": name, "args": args}, mid)
 
+# -------------------- Adaptador MCP externo (FS/Git) --------------------
+from src.util.mcp_process import MCPProcess  # requiere src/util/mcp_process.py
+
 # -------------------- Conversación --------------------
 History = List[Tuple[str, str]]  # (role, content)
 
 def build_prompt(history: History, user_msg: str, max_chars: int = 4000) -> str:
-    """
-    Empaqueta el historial en un prompt compacto:
-    [system implícito lo pone el server] + últimos turnos + mensaje del usuario.
-    Limitamos a ~max_chars para no exceder token window.
-    """
     lines: List[str] = []
     for role, text in history:
         lines.append(f"{role.upper()}: {text.strip()}")
     lines.append(f"USER: {user_msg.strip()}")
     prompt = "\n".join(lines)
-    # recorta por la cola si se pasa
     if len(prompt) > max_chars:
         prompt = prompt[-max_chars:]
-        # intenta no cortar en mitad de línea
         idx = prompt.find("\n")
         if idx > 0:
             prompt = prompt[idx+1:]
@@ -70,17 +68,28 @@ def save_transcript(history: History, path: Path):
 # -------------------- CLI --------------------
 HELP = """Comandos:
   /help                Muestra esta ayuda
-  /tools               Lista herramientas disponibles
+  /tools               Lista herramientas del server local
   /new                 Reinicia el contexto
   /save [archivo.md]   Guarda el transcript (default: reports/chat.md)
-  /call NAME {json}    Llama una tool arbitraria con args en JSON
+  /call NAME {json}    Llama una tool del server local con args en JSON
+
+  # Filesystem MCP externo (si FS_MCP_CMD está definido)
+  /fs.list             Lista las tools del FS MCP
+  /fs.call NAME {json} Llama una tool del FS MCP
+  /fs.rpc {json}       RPC crudo al FS MCP (ej: {"method":"tools/list"})
+
+  # Git MCP externo (si GIT_MCP_CMD está definido)
+  /git.list            Lista las tools del Git MCP
+  /git.call NAME {json}Llama una tool del Git MCP
+  /git.rpc {json}      RPC crudo al Git MCP
+
   /exit                Salir
 
 Sin comando: envía el mensaje al LLM (tool llm_chat) manteniendo contexto.
 """
 
 def main():
-    # Lanza el server MCP
+    # Lanza el server MCP local
     env = {**os.environ, "PYTHONPATH": str(PROJ_ROOT)}
     proc = subprocess.Popen(
         [sys.executable, "main.py"],
@@ -93,7 +102,7 @@ def main():
         bufsize=0,
     )
 
-    # inicializa y obtiene tools
+    # Inicializa y lista tools locales
     try:
         rpc_call(proc, "initialize", {"client": "cli"}, mid=0)
     except Exception:
@@ -105,13 +114,39 @@ def main():
         print("⚠️  No está llm_chat; revisa tu server/registry.")
     print("💬 Escribe tu mensaje (o /help). Ctrl+C o /exit para salir.\n")
 
+    # Arrancar FS MCP si FS_MCP_CMD está definido
+    fs_cmd = os.getenv("FS_MCP_CMD")
+    fs: Optional[MCPProcess] = None
+    if fs_cmd:
+        try:
+            fs = MCPProcess(fs_cmd, cwd=str(PROJ_ROOT), env=os.environ).start()
+            fs.initialize()
+            names = [t["name"] for t in fs.tools_list()]
+            print(f"🗂️  FS MCP listo: {', '.join(names) or '(sin tools?)'}")
+        except Exception as e:
+            print(f"⚠️  FS MCP no inicializó: {e}")
+            fs = None
+
+    # Arrancar Git MCP si GIT_MCP_CMD está definido
+    git_cmd = os.getenv("GIT_MCP_CMD")
+    git: Optional[MCPProcess] = None
+    if git_cmd:
+        try:
+            git = MCPProcess(git_cmd, cwd=str(PROJ_ROOT), env=os.environ).start()
+            git.initialize()
+            names = [t["name"] for t in git.tools_list()]
+            print(f"📦  Git MCP listo: {', '.join(names) or '(sin tools?)'}")
+        except Exception as e:
+            print(f"⚠️  Git MCP no inicializó: {e}")
+            git = None
+
     # Config “suave” por entorno
     default_temp = float(os.getenv("LLM_TEMPERATURE", "0.1"))
     default_max_tokens = int(os.getenv("LLM_MAX_TOKENS", "120"))
 
-    history: History = []  # [(role, content)]
-
+    history: History = []
     mid = 10
+
     try:
         while True:
             try:
@@ -170,6 +205,112 @@ def main():
                         print(f"[call error] {e}")
                     continue
 
+                # ----- Filesystem MCP externo -----
+                if cmd == "/fs.list":
+                    if not fs:
+                        print("FS MCP no está configurado (FS_MCP_CMD).")
+                        continue
+                    try:
+                        tools = fs.tools_list()
+                        print("🗂️  FS tools:", ", ".join(t["name"] for t in tools))
+                    except Exception as e:
+                        print(f"[fs.list error] {e}")
+                    continue
+
+                if cmd == "/fs.call":
+                    if not fs:
+                        print("FS MCP no está configurado (FS_MCP_CMD).")
+                        continue
+                    if len(parts) < 3:
+                        print("Uso: /fs.call NAME {json_args}")
+                        continue
+                    name = parts[1]
+                    try:
+                        args = json.loads(parts[2])
+                    except Exception as e:
+                        print(f"JSON inválido: {e}")
+                        continue
+                    try:
+                        result = fs.tools_call(name, args)
+                        print(orjson.dumps(result, option=orjson.OPT_INDENT_2).decode())
+                    except Exception as e:
+                        print(f"[fs.call error] {e}")
+                    continue
+
+                if cmd == "/fs.rpc":
+                    if not fs:
+                        print("FS MCP no está configurado (FS_MCP_CMD).")
+                        continue
+                    if len(parts) < 2:
+                        print('Uso: /fs.rpc {"method":"tools/list"}')
+                        continue
+                    try:
+                        payload = json.loads(parts[1])
+                    except Exception as e:
+                        print(f"JSON inválido: {e}")
+                        continue
+                    try:
+                        m = payload.get("method")
+                        params = payload.get("params")
+                        res = fs.rpc_call(m, params)
+                        print(orjson.dumps(res, option=orjson.OPT_INDENT_2).decode())
+                    except Exception as e:
+                        print(f"[fs.rpc error] {e}")
+                    continue
+
+                # ----- Git MCP externo -----
+                if cmd == "/git.list":
+                    if not git:
+                        print("Git MCP no está configurado (GIT_MCP_CMD).")
+                        continue
+                    try:
+                        tools = git.tools_list()
+                        print("📦  Git tools:", ", ".join(t["name"] for t in tools))
+                    except Exception as e:
+                        print(f"[git.list error] {e}")
+                    continue
+
+                if cmd == "/git.call":
+                    if not git:
+                        print("Git MCP no está configurado (GIT_MCP_CMD).")
+                        continue
+                    if len(parts) < 3:
+                        print("Uso: /git.call NAME {json_args}")
+                        continue
+                    name = parts[1]
+                    try:
+                        args = json.loads(parts[2])
+                    except Exception as e:
+                        print(f"JSON inválido: {e}")
+                        continue
+                    try:
+                        result = git.tools_call(name, args)
+                        print(orjson.dumps(result, option=orjson.OPT_INDENT_2).decode())
+                    except Exception as e:
+                        print(f"[git.call error] {e}")
+                    continue
+
+                if cmd == "/git.rpc":
+                    if not git:
+                        print("Git MCP no está configurado (GIT_MCP_CMD).")
+                        continue
+                    if len(parts) < 2:
+                        print('Uso: /git.rpc {"method":"tools/list"}')
+                        continue
+                    try:
+                        payload = json.loads(parts[1])
+                    except Exception as e:
+                        print(f"JSON inválido: {e}")
+                        continue
+                    try:
+                        m = payload.get("method")
+                        params = payload.get("params")
+                        res = git.rpc_call(m, params)
+                        print(orjson.dumps(res, option=orjson.OPT_INDENT_2).decode())
+                    except Exception as e:
+                        print(f"[git.rpc error] {e}")
+                    continue
+
                 print("Comando no reconocido. /help para ayuda.")
                 continue
 
@@ -179,7 +320,6 @@ def main():
 
             args = {
                 "prompt": prompt,
-                # No mandamos "system": el server usa prompts/system_llm.txt
                 "temperature": default_temp,
                 "max_tokens": default_max_tokens,
             }
