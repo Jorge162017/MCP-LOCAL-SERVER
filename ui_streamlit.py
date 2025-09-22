@@ -1,116 +1,106 @@
 #!/usr/bin/env python3
-# ui_streamlit.py — Streamlit UI para tu MCP local + dos remotos HTTP (/rpc) + Filesystem (MCP) + Git (MCP)
-
+# ui_streamlit.py — Streamlit UI para MCP local + HTTP remotos + Filesystem (MCP) + Git (MCP)
 from __future__ import annotations
-import os, sys, time, subprocess, shlex, asyncio, re, json
+import os, sys, time, subprocess, shlex, asyncio, json, re
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 import streamlit as st
 import orjson
 import aiohttp
-import re
 
-# ─── FSClient (versión con server_cmd y métodos sync) ─────────────────────────
+# ── .env ──────────────────────────────────────────────────────────────────────
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(filename=".env", usecwd=True), override=False)
+
+# ── Groq (import tolerante) ───────────────────────────────────────────────────
+try:
+    from groq import Groq  # type: ignore
+except Exception:
+    Groq = None  # type: ignore
+
+# ── FSClient (MCP stdio con server_cmd + sync helpers) ────────────────────────
 from fs_mcp_local import FSClient
 
 
+# ───────────────────────── util paths ─────────────────────────────────────────
 def _find_project_root(start: Path) -> Path:
     p = start.resolve()
     for cand in [p, *p.parents]:
         if (cand / "main.py").exists() and (cand / "src").exists():
             return cand
-    # fallback: si no se encontró, usa el directorio del archivo
     return start.parent
-
 
 PROJ_ROOT = _find_project_root(Path(__file__))
 
-# ───────────────────────── Helpers NL (FS Chat) ─────────────────────────
-import re
-from typing import Dict, Any, List
-
+# ───────────────────────── NL Helpers (FS) ────────────────────────────────────
 def parse_fs_command_es(texto: str) -> List[Dict[str, Any]]:
-    """
-    Devuelve una lista de acciones a ejecutar sobre el FS.
-    Cada acción es un dict con:
-      - {"op":"list",  "path": "..."}
-      - {"op":"read",  "path": "..."}
-      - {"op":"mkdir", "path": "..."}
-      - {"op":"write", "path": "...", "content": "..."}
-    Soporta frases compuestas: "crea una carpeta X y dentro un archivo Y que diga Z".
-    """
     t = (texto or "").strip()
     tl = t.lower()
-
     actions: List[Dict[str, Any]] = []
 
-    # --- órdenes directas simples ---
-    # listar <ruta>
-    m = re.search(r"\b(listar|lista|muestra|mostrar|muéstrame)\b(?:\s+(?:el\s+directorio|carpeta))?\s*(.+)$", tl)
+    m = re.search(r'\b(listar|lista|muestra|mostrar|muéstrame)\b(?:\s+(?:el\s+directorio|carpeta))?\s*(.+)$', tl, re.I)
     if m:
         ruta = (m.group(2) or ".").strip() or "."
         return [{"op": "list", "path": ruta}]
 
-    # leer <archivo>
-    m = re.search(r"\b(lee|leer|abrir|abre)\b\s+(.+)$", tl)
+    m = re.search(r'\b(lee|leer|abrir|abre)\b\s+(.+)$', tl, re.I)
     if m:
         return [{"op": "read", "path": m.group(2).strip()}]
 
-    # --- componentes de una frase compuesta ---
-    m_dir  = re.search(r"(?:carpeta|directorio)\s+([a-z0-9_\-./]+)", tl)
-    m_file = re.search(r"(?:archivo|fichero)\s+([a-z0-9_\-./]+(?:\.[a-z0-9]+)?)", tl)
-    # contenido: usa texto original (con mayúsculas) y flag IGNORECASE
-    m_cont = re.search(r"(?:que\s+diga|con\s+contenido)\s+(.+)$", t, flags=re.I)
+    dir_name = None
+    m = re.search(r'(?:carpeta|directorio)\s+(?:llamada|llamado|de\s+nombre|con\s+nombre)\s+["“]([^"”]+)["”]', t, re.I)
+    if m: dir_name = m.group(1).strip()
+    if not dir_name:
+        m = re.search(r'(?:carpeta|directorio)\s+(?:llamada|llamado|de\s+nombre|con\s+nombre)\s+([^\s"“”]+)', t, re.I)
+        if m: dir_name = m.group(1).strip()
+    if not dir_name:
+        m = re.search(r'(?:carpeta|directorio)\s+(?!llamada\b|llamado\b|con\s+nombre\b|de\s+nombre\b)["“]?([^\s"”]+)["”]?', t, re.I)
+        if m: dir_name = m.group(1).strip()
 
-    dir_name  = m_dir.group(1).strip()  if m_dir  else None
-    file_name = m_file.group(1).strip() if m_file else None
-    content   = (m_cont.group(1).strip() if m_cont else "hola")
+    file_name = None
+    m = re.search(r'(?:archivo|fichero)\s+["“]([^"”]+)["”]', t, re.I)
+    if m:
+        file_name = m.group(1).strip()
+    else:
+        m = re.search(r'(?:archivo|fichero)\s+([a-z0-9_\-./][^\s"]*)', t, re.I)
+        if m: file_name = m.group(1).strip()
 
-    # Si pidió crear carpeta, va primero
+    m_cont = re.search(r'(?:que\s+diga|con\s+contenido)\s+(.+)$', t, re.I)
+    content = (m_cont.group(1).strip() if m_cont else "hola")
+
     if dir_name:
         actions.append({"op": "mkdir", "path": dir_name})
 
-    # Si pidió archivo, compón la ruta final respetando subcarpetas
     if file_name:
-        if dir_name and not file_name.startswith(dir_name.rstrip("/") + "/"):
-            write_path = f"{dir_name.rstrip('/')}/{file_name}"
-        else:
-            write_path = file_name
+        write_path = f"{dir_name.rstrip('/')}/{file_name}" if dir_name and not file_name.startswith(dir_name.rstrip('/') + '/') else file_name
         actions.append({"op": "write", "path": write_path, "content": content})
 
     if actions:
         return actions
 
-    # fallback: "escribe foo.txt" sin carpeta/ contenido
-    m = re.search(r"\bescribe\b\s+([a-z0-9_\-./]+)", tl)
+    # ← línea corregida
+    m = re.search(r'\bescribe\b\s+([a-z0-9_\-./][^\s"]*)', tl, re.I)
     if m:
         return [{"op": "write", "path": m.group(1).strip(), "content": "hola"}]
 
     return [{"op": "unknown"}]
-    
 
-# ───────────────────────── Router NL → tools (MCP) ─────────────────────────
-# Comandos slash rápidos admitidos:
-#   /pdf path="..." pages=all tables=true
-#   /profile path="..."
-#   /forecast path="..." date="date" value="value" horizon=6 freq="M"
-#   /report title="..." sections="A;B;C" format="pdf" outfile="reports/demo.pdf"
 
+
+# ───────────────────────── Router NL → tools (LOCAL/HTTP) ─────────────────────
 _SLASH = re.compile(r'^/(\w+)\b(.*)$', re.IGNORECASE)
 
 def _parse_kv(s: str) -> dict[str, Any]:
-    # key="quoted" | key=bare | flags type bool
     out: dict[str, Any] = {}
     for m in re.finditer(r'(\w+)\s*=\s*"(.*?)"', s):
         out[m.group(1)] = m.group(2)
-    # bare values (sin comillas)
     for m in re.finditer(r'(\w+)\s*=\s*([^\s"]+)', s):
         k, v = m.group(1), m.group(2)
-        if k in out:  # ya vino con comillas
+        if k in out:  # ya vino quoted
             continue
-        if v.lower() in {"true","false"}:
-            out[k] = (v.lower()=="true")
+        if v.lower() in {"true", "false"}:
+            out[k] = (v.lower() == "true")
         elif v.isdigit():
             out[k] = int(v)
         else:
@@ -118,29 +108,23 @@ def _parse_kv(s: str) -> dict[str, Any]:
     return out
 
 def _safe_split_sections(s: str) -> list[str]:
-    # "A;B;C" -> ["A","B","C"]
     return [p.strip() for p in s.split(";") if p.strip()]
 
 def route_mcp_intent_es(text: str) -> tuple[str, dict] | None:
     t = text.strip()
-
-    # 1) Slash commands
     m = _SLASH.match(t)
     if m:
         cmd, rest = m.group(1).lower(), m.group(2)
         args = _parse_kv(rest)
         if cmd == "pdf":
             args.setdefault("pages", "all")
-            # alias tables -> extract_tables
             if "tables" in args and "extract_tables" not in args:
                 args["extract_tables"] = bool(args.pop("tables"))
             return ("pdf_extract", args)
         if cmd == "profile":
             return ("data_profile", args)
         if cmd == "forecast":
-            # defaults razonables
             args.setdefault("date_col", "date")
-            # acepta value|value_col|column como alias
             if "value" in args and "value_col" not in args:
                 args["value_col"] = args.pop("value")
             args.setdefault("value_col", "value")
@@ -157,12 +141,10 @@ def route_mcp_intent_es(text: str) -> tuple[str, dict] | None:
             return ("report_generate", args)
         return None
 
-    # 2) Lenguaje natural rápido
     t_low = t.lower()
 
     # pdf_extract
     if re.search(r'(extrae|saca|obt[eé]n).*(texto|tablas).*pdf', t_low):
-        # path después de "de " o entre comillas
         mpath = re.search(r'"([^"]+\.pdf)"|(?:de\s+)([^\s"“”]+\.pdf)', t, re.IGNORECASE)
         path = (mpath.group(1) or mpath.group(2)) if mpath else ""
         extract_tables = "tabla" in t_low
@@ -171,7 +153,7 @@ def route_mcp_intent_es(text: str) -> tuple[str, dict] | None:
         if mpages:
             r = mpages.group(1)
             if "-" in r:
-                a,b = r.split("-")
+                a, b = r.split("-")
                 try:
                     pages = [int(a), int(b)]
                 except Exception:
@@ -193,16 +175,7 @@ def route_mcp_intent_es(text: str) -> tuple[str, dict] | None:
     if re.search(r'(pron[oó]sti|forecast|predic)', t_low):
         mpath = re.search(r'"([^"]+\.csv)"|(?:de\s+)([^\s"“”]+\.csv)', t, re.IGNORECASE)
         path = (mpath.group(1) or mpath.group(2)) if mpath else ""
-        # Defaults seguros
-        args = {
-            "path": path,
-            "date_col": "date",
-            "value_col": "value",
-            "horizon": 6,
-            "freq": "M",
-            "model": "auto",
-        }
-        # si el usuario mencionó columnas: "valor=ventas" "fecha=ds"
+        args = {"path": path, "date_col": "date", "value_col": "value", "horizon": 6, "freq": "M", "model": "auto"}
         mval = re.search(r'valor\s*=\s*([A-Za-z0-9_]+)', t_low)
         if mval: args["value_col"] = mval.group(1)
         mdat = re.search(r'(fecha|date)\s*=\s*([A-Za-z0-9_]+)', t_low)
@@ -216,11 +189,8 @@ def route_mcp_intent_es(text: str) -> tuple[str, dict] | None:
 
     # report_generate
     if re.search(r'(genera|crea|haz).*(reporte|informe)', t_low):
-        # secciones opcionales dentro de comillas separadas por ';'
         msecs = re.search(r'secciones?\s*:\s*"([^"]+)"', t, re.IGNORECASE)
-        sections = _safe_split_sections(msecs.group(1)) if msecs else [
-            "Resumen ejecutivo", "Resultados", "Conclusiones"
-        ]
+        sections = _safe_split_sections(msecs.group(1)) if msecs else ["Resumen ejecutivo", "Resultados", "Conclusiones"]
         fmt = "pdf" if "pdf" in t_low else ("html" if "html" in t_low else "pdf")
         mtit = re.search(r't[íi]tulo\s*:\s*"([^"]+)"', t, re.IGNORECASE)
         title = mtit.group(1) if mtit else "Reporte"
@@ -228,49 +198,20 @@ def route_mcp_intent_es(text: str) -> tuple[str, dict] | None:
 
     return None
 
-NL_HELP = """
-**Comandos rápidos (chat):**
-- *Natural*:
-  - "extrae texto del pdf \"/ruta/doc.pdf\"" → pdf_extract
-  - "extrae tablas del pdf \"/ruta/doc.pdf\" páginas 1-3" → pdf_extract
-  - "perfil csv \"/ruta/data.csv\"" → data_profile
-  - "pronóstico de \"/ruta/data.csv\" valor=ventas fecha=ds horizonte=12 mensual" → ts_forecast
-  - "genera un reporte pdf título:\"Mi Informe\" secciones:\"Resumen;Resultados;Conclusiones\"" → report_generate
-- *Slash*:
-  - `/pdf path="..." pages=all tables=true`
-  - `/profile path="..."`
-  - `/forecast path="..." date="date" value="value" horizon=6 freq="M"`
-  - `/report title="..." sections="A;B;C" format="pdf"`
-"""
 
-
-# ---------- Git NL helpers ----------
-def call_git_tool(name: str, args: dict) -> dict:
-    """Llama la tool del servidor Git. Si falla, reintenta agregando repo_path."""
-    cli = S().git_client
-    if not cli:
-        raise RuntimeError("Git MCP no iniciado.")
-    try:
-        return cli.call_tool_sync(name, args)
-    except Exception:
-        # Algunas versiones exigen repo_path; reintenta con él
-        merged = {"repo_path": S().git_repo, **(args or {})}
-        return cli.call_tool_sync(name, merged)
-
+# ───────────────────────── Git NL helpers ─────────────────────────────────────
 def parse_git_command_es(texto: str) -> list[dict]:
     """
-    Convierte una orden en español a una lista de pasos [{tool, args}] para mcp-server-git.
-    Soporta: status, ramas, crear rama, checkout, add, commit, reset, log, diff, show, init.
+    Devuelve una lista de pasos para mcp-server-git SIN default.
+    Si no reconoce el mensaje, devuelve lista vacía para permitir fallback a chat.
     """
     t = texto.strip().lower()
     steps: list[dict] = []
 
     if re.search(r"\b(status|estado)\b", t):
         return [{"tool": "git_status", "args": {}}]
-
     if re.search(r"\b(ramas|branches)\b", t):
         return [{"tool": "git_branch", "args": {}}]
-
     if re.search(r"\b(init|inicializa)\b", t):
         return [{"tool": "git_init", "args": {}}]
 
@@ -281,7 +222,7 @@ def parse_git_command_es(texto: str) -> list[dict]:
         if base: args["base"] = base
         steps.append({"tool": "git_create_branch", "args": args})
 
-    m = re.search(r"(?:cámbiate|cambiar|checkout)\s+(?:a\s+ram[ao]\s+)?([a-z0-0_\-\/\.]+)", t)
+    m = re.search(r"(?:cámbiate|cambiar|checkout)\s+(?:a\s+ram[ao]\s+)?([a-z0-9_\-\/\.]+)", t)
     if m:
         steps.append({"tool": "git_checkout", "args": {"name": m.group(1)}})
 
@@ -306,7 +247,7 @@ def parse_git_command_es(texto: str) -> list[dict]:
     m = re.search(r"\b(?:log|historial|commits)\b\s*(\d{1,3})?", t)
     if m:
         n = m.group(1)
-        steps.append({"tool": "git_log", "args": {"max_count": int(n)} if n else {}})
+        steps.append({"tool": "git_log", "args": {"max_count": int(n)} if n else {"max_count": 10}})
 
     if re.search(r"\b(sin\s+preparar|unstaged)\b", t):
         steps.append({"tool": "git_diff_unstaged", "args": {}})
@@ -321,11 +262,11 @@ def parse_git_command_es(texto: str) -> list[dict]:
     if m:
         steps.append({"tool": "git_show", "args": {"rev": m.group(1)}})
 
-    return steps or [{"tool": "git_status", "args": {}}]
+    # NO default aquí: si no hay match, devolver lista vacía para caer al chat
+    return steps
 
 
-
-# ───────────────────────── JSON-RPC (stdio) ─────────────────────────
+# ───────────────────────── JSON-RPC (stdio/local) ─────────────────────────────
 def _send(proc, payload: dict):
     proc.stdin.write(orjson.dumps(payload) + b"\n")
     proc.stdin.flush()
@@ -339,19 +280,16 @@ def _send(proc, payload: dict):
         raise RuntimeError(f"Servidor MCP no respondió (STDOUT vacío). {err}")
     return orjson.loads(line)
 
-
 def rpc_call_stdio(proc, method: str, params: dict | None = None, mid: int = 1):
     payload = {"jsonrpc": "2.0", "id": mid, "method": method}
     if params is not None:
         payload["params"] = params
     return _send(proc, payload)
 
-
 def call_tool_stdio(proc, name: str, args: dict, mid: int):
     return rpc_call_stdio(proc, "tools/call", {"name": name, "args": args}, mid)
 
-
-# ───────────────────────── JSON-RPC (HTTP) ─────────────────────────
+# ───────────────────────── JSON-RPC (HTTP) ────────────────────────────────────
 async def http_rpc(url: str, payload: dict, bearer: Optional[str] = None) -> dict:
     headers = {"Content-Type": "application/json"}
     if bearer:
@@ -361,8 +299,7 @@ async def http_rpc(url: str, payload: dict, bearer: Optional[str] = None) -> dic
             text = await resp.text()
             return orjson.loads(text)
 
-
-# ───────────────────────── Estado ─────────────────────────
+# ───────────────────────── Estado ─────────────────────────────────────────────
 def _init_state():
     ss = st.session_state
     ss.setdefault("proc", None)
@@ -370,39 +307,27 @@ def _init_state():
     ss.setdefault("history", [])
     ss.setdefault("temperature", float(os.getenv("LLM_TEMPERATURE", "0.1")))
     ss.setdefault("max_tokens", int(os.getenv("LLM_MAX_TOKENS", "120")))
-
-    # destino: local | http1 | http2 | fs | git
-    ss.setdefault("rpc_mode", "local")
-
-    # Remoto A
+    ss.setdefault("rpc_mode", "local")  # local | http1 | http2 | fs | git
     ss.setdefault("remote1_url", "http://127.0.0.1:8787/rpc")
     ss.setdefault("remote1_token", "")
-
-    # Remoto B
     ss.setdefault("remote2_url", "http://127.0.0.1:8788/rpc")
     ss.setdefault("remote2_token", "")
-
-    # Local stdio
     ss.setdefault("local_cmd", f"{sys.executable} {str(PROJ_ROOT / 'main.py')}")
     ss.setdefault("local_cwd", str(PROJ_ROOT))
-
-    # Filesystem (MCP)
-    ss.setdefault("fs_client", None)                 # instancia FSClient (sync)
-    ss.setdefault("fs_root", str(PROJ_ROOT))         # raíz expuesta por el server FS
-    ss.setdefault("fs_started", False)               # flag visual
-
-    # Git (MCP)
+    ss.setdefault("fs_client", None)
+    ss.setdefault("fs_root", str(PROJ_ROOT))
+    ss.setdefault("fs_started", False)
     ss.setdefault("git_client", None)
     ss.setdefault("git_started", False)
-    ss.setdefault("git_root", str(PROJ_ROOT))     # ← fuente de verdad
-    ss.setdefault("git_repo", ss["git_root"]) 
+    ss.setdefault("git_root", str(PROJ_ROOT))
+    ss.setdefault("git_repo", ss["git_root"])
+    ss.setdefault("_groq_client", None)
 
 def S():
     _init_state()
     return st.session_state
 
-
-# ───────────────────────── Control server local ─────────────────────────
+# ───────────────────────── Control server local ───────────────────────────────
 def _launch_process(cmd_line: str, cwd: str | None) -> subprocess.Popen:
     env = {**os.environ, "PYTHONPATH": str(PROJ_ROOT)}
     if os.name == "nt":
@@ -413,16 +338,10 @@ def _launch_process(cmd_line: str, cwd: str | None) -> subprocess.Popen:
         except Exception:
             popen_args = dict(args=cmd_line, shell=True)
     return subprocess.Popen(
-        **popen_args,
-        cwd=cwd or str(PROJ_ROOT),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=False,
-        bufsize=0,
-        env=env,
+        **popen_args, cwd=cwd or str(PROJ_ROOT),
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=False, bufsize=0, env=env,
     )
-
 
 def start_server_local():
     s = S()
@@ -434,7 +353,6 @@ def start_server_local():
         rpc_call_stdio(s.proc, "initialize", {"client": "streamlit-ui"}, mid=0)
     except Exception:
         pass
-
 
 def stop_server_local():
     s = S()
@@ -450,13 +368,11 @@ def stop_server_local():
     s.proc = None
     s.history = []
 
-
 def local_running() -> bool:
     s = S()
     return bool(s.proc and s.proc.poll() is None)
 
-
-# ───────────────────────── Filesystem MCP (SYNC) ─────────────────────────
+# ───────────────────────── Filesystem MCP (SYNC) ──────────────────────────────
 def fs_running() -> bool:
     return bool(S().fs_started and S().fs_client)
 
@@ -465,7 +381,6 @@ def start_fs():
     if s.fs_client is None:
         s.fs_client = FSClient(
             root=s.fs_root,
-            # Paquete npm oficial del FS:
             server_cmd=["npx", "-y", "@modelcontextprotocol/server-filesystem", s.fs_root],
         )
     s.fs_client.start_sync()
@@ -479,8 +394,7 @@ def stop_fs():
     s.fs_client.stop_sync()
     s.fs_started = False
 
-
-# ───────────────────────── Git MCP (PYTHON) ─────────────────────────────
+# ───────────────────────── Git MCP (PYTHON) ───────────────────────────────────
 def git_running() -> bool:
     return bool(S().git_started and S().git_client)
 
@@ -488,7 +402,6 @@ def start_git():
     s = S()
     cmd = [sys.executable, "-m", "mcp_server_git", "--repository", s.git_repo]
     if s.git_client is None:
-        # pass_root=False (por defecto) => NO añade root extra
         s.git_client = FSClient(root=s.git_repo, server_cmd=cmd)
     s.git_client.start_sync()
     s.git_started = True
@@ -501,16 +414,14 @@ def stop_git():
     s.git_client.stop_sync()
     s.git_started = False
 
-
-# ───────────────────────── Wrappers de destino ─────────────────────────
+# ───────────────────────── Wrappers RPC ───────────────────────────────────────
 def _current_http_conf() -> tuple[str, Optional[str]]:
     s = S()
     if s.rpc_mode == "http1":
         return s.remote1_url.strip(), (s.remote1_token.strip() or None)
     elif s.rpc_mode == "http2":
         return s.remote2_url.strip(), (s.remote2_token.strip() or None)
-    return "", None  # no aplica
-
+    return "", None
 
 def rpc_initialize() -> dict:
     s = S()
@@ -523,7 +434,6 @@ def rpc_initialize() -> dict:
     payload = {"jsonrpc": "2.0", "id": "init", "method": "initialize", "params": {"client": "streamlit-ui"}}
     return asyncio.run(http_rpc(url, payload, tok))
 
-
 def rpc_tools_list() -> list[dict]:
     s = S()
     if s.rpc_mode == "local":
@@ -532,7 +442,6 @@ def rpc_tools_list() -> list[dict]:
     url, tok = _current_http_conf()
     res = asyncio.run(http_rpc(url, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, tok))
     return res["result"]["tools"]
-
 
 def rpc_tools_call(name: str, args: dict) -> dict:
     s = S()
@@ -550,8 +459,7 @@ def rpc_tools_call(name: str, args: dict) -> dict:
         raise RuntimeError(res["error"].get("message"))
     return res["result"]
 
-
-# ───────────────────────── Chat helpers ─────────────────────────
+# ───────────────────────── Chat helpers (server llm_chat) ─────────────────────
 def build_prompt(user_msg: str, max_chars: int = 4000) -> str:
     s = S()
     lines: List[str] = []
@@ -566,65 +474,170 @@ def build_prompt(user_msg: str, max_chars: int = 4000) -> str:
             prompt = prompt[i + 1 :]
     return prompt
 
-
 def chat_llm(user_msg: str) -> str:
     s = S()
     if s.rpc_mode == "local" and not local_running():
         raise RuntimeError("Servidor MCP local no está corriendo")
     s.history.append(("user", user_msg))
-    out = rpc_tools_call(
-        "llm_chat",
-        {
-            "prompt": build_prompt(user_msg),
-            "temperature": float(s.temperature),
-            "max_tokens": int(s.max_tokens),
-        },
-    )
+    out = rpc_tools_call("llm_chat", {"prompt": build_prompt(user_msg), "temperature": float(s.temperature), "max_tokens": int(s.max_tokens)})
     text = (out.get("text") or "").strip() or "(respuesta vacía)"
     s.history.append(("assistant", text))
     return text
 
-# ─── Helpers de UI (chips, previews, tablas) ─────────────────────────────────
-def _chip(text: str) -> None:
-    st.markdown(
-        f"<span style='background:#1f2937;border:1px solid #374151;"
-        f"padding:.15rem .5rem;border-radius:.5rem;font-size:.85rem;"
-        f"white-space:nowrap'>{text}</span>",
-        unsafe_allow_html=True,
+# ───────────────────────── Tools awareness ────────────────────────────────────
+def get_connected_tools_list() -> list[dict]:
+    mode = S().rpc_mode
+    try:
+        if mode in ("local", "http1", "http2"):
+            return rpc_tools_list()
+        if mode == "fs" and fs_running():
+            return S().fs_client.tools_list_sync()
+        if mode == "git" and git_running():
+            return S().git_client.tools_list_sync()
+    except Exception:
+        return []
+    return []
+
+def format_tools_brief(tools: list[dict]) -> str:
+    if not tools:
+        return "No detecté tools publicadas por el servidor actual."
+    lines = []
+    for t in tools[:50]:
+        name = t.get("name") or "—"
+        desc = (t.get("description") or "").strip()
+        lines.append(f"- **{name}**" + (f" — {desc}" if desc else ""))
+    return "\n".join(lines)
+
+def is_tools_query(text: str) -> bool:
+    s = (text or "").lower()
+    return any(k in s for k in ["que tools", "qué tools", "que herramientas", "qué herramientas", "tools tienes", "lista tools", "list tools", "tools/list", "tools?"])
+
+# ───────────────────────── Chat cliente (Groq con contexto) ───────────────────
+DEFAULT_GROQ_CANDIDATES = [
+    os.getenv("CLIENT_GROQ_MODEL", "").strip() or "llama-3.3-70b-versatile",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "gemma2-9b-it",
+]
+
+def _history_to_messages(system_prompt: str | None = None) -> list[dict]:
+    s = S()
+    msgs: list[dict] = []
+    if system_prompt:
+        msgs.append({"role": "system", "content": system_prompt})
+    for role, text in s.history:
+        msgs.append({"role": "user" if role == "user" else "assistant", "content": text})
+    return msgs
+
+def client_llm_chat(user_msg: str) -> str:
+    """
+    Chat directo con Groq cuando el destino no expone llm_chat.
+    Incluye el contexto del server y sus tools para evitar alucinaciones.
+    """
+    s = S()
+    if Groq is None:
+        raise RuntimeError("Falta el SDK de Groq. Instala con: pip install groq")
+
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Falta GROQ_API_KEY en tu .env")
+
+    client = Groq(api_key=api_key)
+
+    tools_ctx = get_connected_tools_list()
+    tools_names = ", ".join([t.get("name", "?") for t in tools_ctx]) if tools_ctx else "(sin tools detectadas)"
+    base_system = os.getenv("CLIENT_LLM_SYSTEM", "Eres un asistente útil que responde en español con precisión.")
+    system_prompt = (
+        f"{base_system}\n"
+        f"Contexto:\n"
+        f"- Destino actual: {s.rpc_mode}\n"
+        f"- Tools disponibles: {tools_names}\n"
+        f"Reglas:\n"
+        f"- Si el usuario pide las herramientas disponibles, responde EXACTAMENTE con esa lista.\n"
+        f"- No inventes herramientas.\n"
     )
 
-def _preview_text(s: str, max_chars: int = 1000) -> str:
-    s = s or ""
-    if len(s) <= max_chars:
-        return s
-    return s[:max_chars] + "\n… (truncado)"
+    msgs = _history_to_messages(system_prompt)
 
-def _show_dir_table(items: list[dict[str, Any]]) -> None:
-    if not items:
-        st.info("Directorio vacío.")
-        return
-    rows = []
-    for it in items:
-        rows.append({
-            "nombre": it.get("name") or it.get("path") or "—",
-            "tipo": it.get("type") or ("dir" if it.get("is_dir") else "file"),
-            "tamaño": it.get("size") or it.get("length") or "—",
-        })
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    last_err = None
+    tried = []
+    for model in [m for i, m in enumerate(DEFAULT_GROQ_CANDIDATES) if m and m not in DEFAULT_GROQ_CANDIDATES[:i]]:
+        tried.append(model)
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=msgs,
+                temperature=float(s.temperature),
+                max_tokens=int(s.max_tokens),
+            )
+            text = (resp.choices[0].message.content or "").strip() or "(respuesta vacía)"
+            s.history.append(("assistant", text))
+            s["__client_llm_model_used__"] = model
+            return text
+        except Exception as e:
+            msg = str(e).lower()
+            if ("decommissioned" in msg or "no longer supported" in msg
+                or "unrecognized" in msg or "does not exist" in msg
+                or "invalid_request_error" in msg):
+                last_err = e
+                continue
+            raise
 
-def _debug_dump(title: str, obj: Any) -> None:
-    with st.expander(f"Ver detalle ({title})"):
-        st.json(obj)
+    raise RuntimeError("No se pudo usar ningún modelo Groq. Probé: " + ", ".join(tried)) from last_err
+
+# ───────────────────────── Ejecutores NL FS/Git ───────────────────────────────
+def run_fs_nl(msg: str) -> tuple[str, list[tuple[str, str, Any]]]:
+    if not fs_running():
+        raise RuntimeError("FS MCP no está corriendo")
+    plan = parse_fs_command_es(msg)
+    results: list[tuple[str, str, Any]] = []
+    if not plan or plan[0].get("op") == "unknown":
+        return ("__unknown__", results)
+    for step in plan:
+        op   = step.get("op")
+        path = step.get("path")
+        if op == "mkdir":
+            res = S().fs_client.create_dir_sync(path)
+            results.append(("mkdir", path, res))
+        elif op == "write":
+            content = step.get("content", "")
+            res = S().fs_client.write_file_sync(path, content)
+            results.append(("write", path, {"preview": content, "raw": res}))
+        elif op == "list":
+            res = S().fs_client.list_dir_sync(path)
+            results.append(("list", path, res))
+        elif op == "read":
+            txt = S().fs_client.read_file_sync(path)
+            results.append(("read", path, txt))
+    return ("ok", results)
+
+def run_git_nl(msg: str) -> tuple[str, list[str]]:
+    """
+    Ejecuta comandos Git derivados del NL. Si el mensaje NO es un comando Git,
+    devuelve "__unknown__", [] para permitir el fallback a chat Groq.
+    """
+    if not git_running():
+        raise RuntimeError("Git MCP no está corriendo")
+    plan = parse_git_command_es(msg)
+    if not plan:  # ← sin match → usa chat Groq en el caller
+        return ("__unknown__", [])
+    repo = getattr(S(), "git_root", str(PROJ_ROOT))
+    steps_exec: list[str] = []
+    for step in plan:
+        args = dict(step.get("args", {}))
+        args.setdefault("repo_path", repo)
+        S().git_client.call_tool_sync(step["tool"], args)
+        steps_exec.append(step["tool"])
+    return ("ok", steps_exec)
 
 
-# ───────────────────────── UI ─────────────────────────
+# ───────────────────────── UI ─────────────────────────────────────────────────
 st.set_page_config(page_title="MCP Local — Streamlit UI", page_icon="🤖", layout="wide")
-st.title("MCP Local — Streamlit UI")
+st.title("MCP Servers")
 
 with st.sidebar:
     st.subheader("Servidor")
 
-    # Radio con 5 modos (local/http1/http2/fs/git)
     options = ["Local (main.py)", "HTTP remoto A", "HTTP remoto B", "Filesystem (MCP)", "Git (MCP)"]
     mode = st.radio(
         "Destino",
@@ -703,7 +716,7 @@ with st.sidebar:
             except Exception as e:
                 st.error(str(e))
 
-    elif S().rpc_mode == "fs":  # ─── Filesystem (MCP)
+    elif S().rpc_mode == "fs":
         S().fs_root = st.text_input("Root expuesto por FS", S().fs_root)
         col1, col2 = st.columns(2)
         if col1.button("Iniciar FS", use_container_width=True):
@@ -719,19 +732,15 @@ with st.sidebar:
             except Exception as e:
                 st.error(str(e))
 
-    else:  # ─── Git (MCP)
-        S().git_root = st.text_input(
-            "Ruta del repo (local)",
-            getattr(S(), "git_root", str(PROJ_ROOT)),
-            help="Debe contener .git",
-        )
+    else:  # Git
+        S().git_root = st.text_input("Ruta del repo (local)", getattr(S(), "git_root", str(PROJ_ROOT)), help="Debe contener .git")
         col1, col2 = st.columns(2)
         if col1.button("Iniciar Git", use_container_width=True):
             try:
                 start_git()
                 st.success(f"Git server iniciado (repo={S().git_repo})")
             except Exception as e:
-                st.error(f"No se pudo iniciar Git: {e}")
+                st.error(f"Git server no pudo iniciar: {e}")
         if col2.button("Detener Git", use_container_width=True):
             try:
                 stop_git()
@@ -762,7 +771,6 @@ with st.sidebar:
                     with st.expander("Ver STDERR del servidor"):
                         st.code(err.strip())
 
-# Estado
 estado = (
     "Corriendo ✅"
     if (
@@ -787,14 +795,19 @@ with tab1:
         st.info("Pulsa *Listar tools (servidor LOCAL/HTTP)* en la barra lateral.")
 
 with tab2:
-    st.markdown("Chat + ejecución automática de tools (usa el *system prompt* del servidor).")
+    st.markdown("Chat + ejecución automática de tools (usa NL para PDF/CSV/Forecast/Report y chat Groq si el destino no tiene llm_chat).")
     if S().rpc_mode == "local" and not local_running():
         st.warning("Inicia el servidor local o elige un remoto.")
     else:
         msg = st.text_area(
             "Mensaje",
             "",
-            placeholder='Ejemplos: extrae texto del pdf "/ruta/doc.pdf" • perfil csv "/ruta/data.csv" • pronóstico de "/ruta/data.csv" valor=ventas fecha=ds • genera un reporte pdf título:"Demo" secciones:"Resumen;Resultados;Conclusiones"',
+            placeholder=(
+                'Ejemplos (LOCAL/HTTP): extrae texto del pdf "/ruta/doc.pdf" • perfil csv "/ruta/data.csv" • '
+                'pronóstico de "/ruta/data.csv" valor=ventas fecha=ds • genera un reporte pdf título:"Demo" '
+                '• (FS) "crea carpeta demo y escribe demo/hola.txt que diga hola mundo" '
+                '• (Git) "status", "crea rama feat/x desde main", "commit \\"msg\\""'
+            ),
             height=120,
         )
         col_send, col_clear = st.columns(2)
@@ -804,22 +817,63 @@ with tab2:
                 st.warning("Escribe un mensaje.")
             else:
                 try:
-                    routed = route_mcp_intent_es(msg)  # <- helpers que pegaste
-                    if routed:
-                        tool_name, tool_args = routed
-                        res = rpc_tools_call(tool_name, tool_args)
-                        st.success(f"✅ Ejecutado: {tool_name}")
-                        with st.expander("Ver args enviados"):
-                            st.json(tool_args)
-                        st.json(res)
-                        # Guardamos algo legible en historial
-                        S().history.append(("user", msg))
-                        S().history.append(("assistant", f"Ejecuté `{tool_name}` con args {tool_args}"))
+                    mode = S().rpc_mode
+                    S().history.append(("user", msg))
+
+                    # 1) Pregunta por tools → responder con lista real (sin LLM)
+                    if is_tools_query(msg):
+                        tools = get_connected_tools_list()
+                        text = format_tools_brief(tools)
+                        st.success("Tools del servidor conectado")
+                        st.markdown(text)
+                        S().history.append(("assistant", text))
                     else:
-                        # Sin match, cae al chat normal
-                        out = chat_llm(msg)
-                        st.success("Respuesta")
-                        st.write(out)
+                        # 2) Modo FS
+                        if mode == "fs":
+                            status, results = run_fs_nl(msg)
+                            if status == "__unknown__":
+                                out = client_llm_chat(msg)
+                                st.info("FS: no se detectó comando NL; usé chat Groq.")
+                                st.success("Respuesta"); st.write(out)
+                            else:
+                                st.success("✅ Ejecutado (FS)")
+                                summary = [f"{k} {p}" for k, p, _ in results]
+                                st.write("FS: " + " → ".join(summary))
+
+                        # 3) Modo Git
+                        elif mode == "git":
+                            status, steps = run_git_nl(msg)
+                            if not steps:
+                                out = client_llm_chat(msg)
+                                st.info("Git: no se detectó comando NL; usé chat Groq.")
+                                st.success("Respuesta"); st.write(out)
+                            else:
+                                st.success("✅ Ejecutado (Git)")
+                                st.write("Git: " + " → ".join(steps))
+
+                        # 4) LOCAL/HTTP
+                        else:
+                            routed = route_mcp_intent_es(msg)
+                            if routed:
+                                tool_name, tool_args = routed
+                                res = rpc_tools_call(tool_name, tool_args)
+                                st.success(f"✅ Ejecutado: {tool_name}")
+                                with st.expander("Ver args enviados"): st.json(tool_args)
+                                st.json(res)
+                                S().history.append(("assistant", f"Ejecuté `{tool_name}` con args {tool_args}"))
+                            else:
+                                tools_cache = st.session_state.get("_tools_cache") or rpc_tools_list()
+                                has_llm = any(t.get("name") == "llm_chat" for t in tools_cache)
+                                if has_llm:
+                                    out = chat_llm(msg)
+                                    st.success("Respuesta"); st.write(out)
+                                else:
+                                    out = client_llm_chat(msg)
+                                    st.info("El destino no tiene 'llm_chat'; usé chat Groq (cliente).")
+                                    st.success("Respuesta"); st.write(out)
+                                used = S().get("__client_llm_model_used__")
+                                if used: st.caption(f"Groq (cliente) • modelo: **{used}**")
+
                 except Exception as e:
                     st.error(str(e))
 
@@ -833,13 +887,23 @@ with tab2:
 
         st.caption("Ayuda de comandos (slash + lenguaje natural)")
         with st.expander("Ver ayuda rápida"):
-            st.markdown(NL_HELP)
-
+            st.markdown("""
+**Natural**:
+- "extrae texto del pdf \"/ruta/doc.pdf\"" → pdf_extract
+- "extrae tablas del pdf \"/ruta/doc.pdf\" páginas 1-3" → pdf_extract
+- "perfil csv \"/ruta/data.csv\"" → data_profile
+- "pronóstico de \"/ruta/data.csv\" valor=ventas fecha=ds horizonte=12 mensual" → ts_forecast
+- "genera un reporte pdf título:\"Mi Informe\" secciones:\"Resumen;Resultados;Conclusiones\"" → report_generate
+**Slash**:
+- `/pdf path="..." pages=all tables=true`
+- `/profile path="..."`
+- `/forecast path="..." date="date" value="value" horizon=6 freq="M"`
+- `/report title="..." sections="A;B;C" format="pdf"`
+""")
 
 with tab3:
     st.markdown("Ejecuta cualquier tool con argumentos JSON en el servidor seleccionado (LOCAL/HTTP).")
 
-    # Carga/refresh de tools (si no hay en caché)
     tools = st.session_state.get("_tools_cache")
     if tools is None:
         try:
@@ -854,36 +918,23 @@ with tab3:
     if not tool_names:
         st.info("No hay tools cargadas. Pulsa **Listar tools** en la barra lateral.")
     else:
-        # Índice inicial basado en el nombre previamente elegido
         prev_name = st.session_state.get("tool_sel_name")
         start_idx = tool_names.index(prev_name) if prev_name in tool_names else 0
 
-        # Selectbox guarda el **NOMBRE** en session_state["tool_sel_name"]
-        sel_name = st.selectbox(
-            "Nombre de la tool",
-            tool_names,
-            index=start_idx,
-            key="tool_sel_name",
-        )
-
-        # Meta de la tool seleccionada
+        sel_name = st.selectbox("Nombre de la tool", tool_names, index=start_idx, key="tool_sel_name")
         sel_tool = next((t for t in tools if t.get("name") == sel_name), {})
         st.caption(sel_tool.get("description", ""))
 
-        # Muestra esquema de entrada si lo hay (ayuda al usuario)
         schema = sel_tool.get("input_schema") or {}
         if schema:
             with st.expander("Ver esquema de entrada (JSON Schema)"):
                 st.json(schema)
 
-        # Sugiere args de ejemplo si no existe aún en el estado
         if "tool_args_txt" not in st.session_state:
-            # Ejemplo inteligente: si existe "properties" arma un dict con claves vacías
             props = (schema.get("properties") or {}) if isinstance(schema, dict) else {}
             example_args = {k: "" for k in props.keys()} if props else {}
             st.session_state["tool_args_txt"] = orjson.dumps(example_args).decode("utf-8")
 
-        # Campo de argumentos
         args_txt = st.text_area("Args (JSON)", st.session_state.get("tool_args_txt", "{}"), key="tool_args_txt")
 
         cols = st.columns([1, 1, 2])
@@ -895,20 +946,15 @@ with tab3:
             else:
                 try:
                     out = rpc_tools_call(sel_name, args)
-                    st.success("OK")
-                    st.json(out)
+                    st.success("OK"); st.json(out)
                 except Exception as e:
                     st.error(str(e))
 
-        # Botón para limpiar el estado de este tab
         if cols[1].button("↺ Resetear selección"):
             for k in ("tool_sel_name", "tool_args_txt"):
                 st.session_state.pop(k, None)
             st.rerun()
 
-
-
-# ─── Filesystem ─────────────────────────────────────────────────────────
 with tab4:
     st.markdown("Operaciones vía **@modelcontextprotocol/server-filesystem**.")
     if S().rpc_mode != "fs":
@@ -922,8 +968,7 @@ with tab4:
         if colA.button("Listar directorio"):
             try:
                 items = S().fs_client.list_dir_sync(path)
-                st.success("OK")
-                st.json(items)
+                st.success("OK"); st.json(items)
             except Exception as e:
                 st.error(str(e))
 
@@ -931,8 +976,7 @@ with tab4:
         if colB.button("Leer archivo"):
             try:
                 text = S().fs_client.read_file_sync(file_to_read)
-                st.success("OK")
-                st.code(text or "(vacío)")
+                st.success("OK"); st.code(text or "(vacío)")
             except Exception as e:
                 st.error(str(e))
 
@@ -941,8 +985,7 @@ with tab4:
         if colC.button("Escribir archivo"):
             try:
                 res = S().fs_client.write_file_sync(file_to_write, content)
-                st.success("OK")
-                st.json(res)
+                st.success("OK"); st.json(res)
             except Exception as e:
                 st.error(str(e))
 
@@ -952,8 +995,7 @@ with tab4:
         if st.button("Crear carpeta"):
             try:
                 res = S().fs_client.create_dir_sync(new_dir)
-                st.success("OK")
-                st.json(res)
+                st.success("OK"); st.json(res)
             except Exception as e:
                 st.error(str(e))
 
@@ -970,76 +1012,54 @@ with tab4:
 
         st.divider()
         st.markdown("### ⚡ Comando en lenguaje natural (FS)")
-        nl_txt = st.text_input(
-            "Ejemplo: crea una carpeta demo y dentro un archivo hola.txt que diga hola mundo",
-            value="crea una carpeta demo y dentro un archivo hola.txt que diga hola mundo",
-        )
+        nl_txt = st.text_input("Ejemplo: crea una carpeta demo y dentro un archivo hola.txt que diga hola mundo",
+                               value="crea una carpeta demo y dentro un archivo hola.txt que diga hola mundo")
+        if st.button("Ejecutar comando FS"):
+            try:
+                plan = parse_fs_command_es(nl_txt)
+                if not isinstance(plan, list):
+                    plan = [plan]
 
-        # --- Ejecutar comando en lenguaje natural (FS) ---
-if st.button("Ejecutar comando FS"):
-    try:
-        plan = parse_fs_command_es(nl_txt)
-
-        # compatibilidad por si alguna vez devuelve un dict
-        if not isinstance(plan, list):
-            plan = [plan]
-
-        if not plan or plan[0].get("op") == "unknown":
-            st.info(
-                "No entendí. Ejemplos:\n"
-                "- **listar .**\n"
-                "- **leer README.md**\n"
-                "- **crear carpeta demo**\n"
-                "- **escribir demo/hola.txt que diga hola mundo**"
-            )
-        else:
-            results = []
-            for step in plan:
-                op   = step.get("op")
-                path = step.get("path")
-
-                if op == "mkdir":
-                    res = S().fs_client.create_dir_sync(path)
-                    results.append(("mkdir", path, res))
-
-                elif op == "write":
-                    content = step.get("content", "")
-                    res = S().fs_client.write_file_sync(path, content)
-                    results.append(("write", path, {"preview": content, "raw": res}))
-
-                elif op == "list":
-                    res = S().fs_client.list_dir_sync(path)
-                    results.append(("list", path, res))
-
-                elif op == "read":
-                    txt = S().fs_client.read_file_sync(path)
-                    results.append(("read", path, txt))
-
+                if not plan or plan[0].get("op") == "unknown":
+                    st.info("No entendí. Ejemplos:\n- **listar .**\n- **leer README.md**\n- **crear carpeta demo**\n- **escribir demo/hola.txt que diga hola mundo**")
                 else:
-                    results.append(("unknown", path, step))
+                    results = []
+                    for step in plan:
+                        op   = step.get("op")
+                        path = step.get("path")
 
-            # Render amigable
-            st.success("Comando ejecutado ✅")
-            for kind, path, res in results:
-                if path:
-                    _chip(path)
-                if kind == "read":
-                    st.code(_preview_text(res), language="text")
-                elif kind == "list":
-                    _show_dir_table(res)
-                elif kind == "write":
-                    st.markdown("**Contenido guardado (preview):**")
-                    st.code(_preview_text(res.get("preview","")), language="text")
-                    _debug_dump(f"write → {path}", res.get("raw"))
-                else:
-                    _debug_dump(kind, res)
+                        if op == "mkdir":
+                            res = S().fs_client.create_dir_sync(path)
+                            results.append(("mkdir", path, res))
+                        elif op == "write":
+                            content = step.get("content", "")
+                            res = S().fs_client.write_file_sync(path, content)
+                            results.append(("write", path, {"preview": content, "raw": res}))
+                        elif op == "list":
+                            res = S().fs_client.list_dir_sync(path)
+                            results.append(("list", path, res))
+                        elif op == "read":
+                            txt = S().fs_client.read_file_sync(path)
+                            results.append(("read", path, txt))
+                        else:
+                            results.append(("unknown", path, step))
 
-    except Exception as e:
-        st.error("Ocurrió un error al ejecutar el comando.")
-        _debug_dump("error", {"error": str(e)})
+                    st.success("Comando ejecutado ✅")
+                    for kind, path, res in results:
+                        if path: st.markdown(f"**{kind}** → `{path}`")
+                        if kind == "read":
+                            st.code(res or "", language="text")
+                        elif kind == "list":
+                            st.json(res)
+                        elif kind == "write":
+                            st.markdown("**Contenido guardado (preview):**")
+                            st.code((res.get("preview","")), language="text")
+                            with st.expander("Raw"): st.json(res.get("raw"))
 
+            except Exception as e:
+                st.error("Ocurrió un error al ejecutar el comando.")
+                with st.expander("Detalle"): st.json({"error": str(e)})
 
-# ─── Git ────────────────────────────────────────────────────────────────
 with tab5:
     st.markdown("Operaciones vía **mcp-server-git** (Python).")
     if S().rpc_mode != "git":
@@ -1047,9 +1067,8 @@ with tab5:
     elif not git_running():
         st.warning("Inicia el servidor Git.")
     else:
-        repo = getattr(S(), "git_root", str(PROJ_ROOT))  # ruta del repo seleccionada en la barra lateral
+        repo = getattr(S(), "git_root", str(PROJ_ROOT))
 
-        # Cargar / refrescar listado de tools del servidor Git
         colGT1, colGT2 = st.columns(2)
         if colGT1.button("Cargar tools (Git)"):
             try:
@@ -1061,7 +1080,6 @@ with tab5:
             except Exception as e:
                 st.error(str(e))
 
-        # Ejecutar cualquier tool por nombre + JSON
         st.divider()
         st.markdown("### Ejecutar tool (Git)")
         tools_git = st.session_state.get("_git_tools_cache", [])
@@ -1081,12 +1099,10 @@ with tab5:
             else:
                 try:
                     out = S().git_client.call_tool_sync(name_git, args_git)
-                    st.success("OK")
-                    st.json(out)
+                    st.success("OK"); st.json(out)
                 except Exception as e:
                     st.error(str(e))
 
-        # Comando en lenguaje natural
         st.divider()
         st.markdown("### ⚡ Comando en lenguaje natural (Git)")
         git_nl = st.text_input(
@@ -1097,44 +1113,36 @@ with tab5:
 
         if st.button("Ejecutar comando (Git)"):
             try:
-                plan = parse_git_command_es(git_nl)  # tu parser NL → lista de pasos
-                st.caption("Plan: " + " → ".join([p["tool"] for p in plan]))
-                for i, step in enumerate(plan, 1):
-                    args = dict(step.get("args", {}))
-                    if "repo_path" not in args:
-                        args["repo_path"] = repo
-                    st.markdown(f"**Paso {i}:** `{step['tool']}`  \nArgs: `{args}`")
-                    res = S().git_client.call_tool_sync(step["tool"], args)
-                    with st.expander("Detalle de respuesta"):
-                        st.json(res)
-                st.success("Comando Git completado ✅")
+                plan = parse_git_command_es(git_nl)
+                if not plan:
+                    st.info("No se detectó comando Git. Escribe un comando o usa el chat en la pestaña 💬.")
+                else:
+                    st.caption("Plan: " + " → ".join([p["tool"] for p in plan]))
+                    for i, step in enumerate(plan, 1):
+                        args = dict(step.get("args", {}))
+                        if "repo_path" not in args:
+                            args["repo_path"] = repo
+                        st.markdown(f"**Paso {i}:** `{step['tool']}`  \nArgs: `{args}`")
+                        res = S().git_client.call_tool_sync(step["tool"], args)
+                        with st.expander("Detalle de respuesta"): st.json(res)
+                    st.success("Comando Git completado ✅")
             except Exception as e:
                 st.error(str(e))
 
-        # Accesos rápidos
         st.divider()
         st.markdown("### Accesos rápidos")
         q1, q2, q3, q4 = st.columns(4)
         if q1.button("Status"):
-            try:
-                st.json(S().git_client.call_tool_sync("git_status", {"repo_path": repo}))
-            except Exception as e:
-                st.error(str(e))
+            try: st.json(S().git_client.call_tool_sync("git_status", {"repo_path": repo}))
+            except Exception as e: st.error(str(e))
         if q2.button("Ramas"):
-            try:
-                st.json(S().git_client.call_tool_sync("git_branch", {"repo_path": repo}))
-            except Exception as e:
-                st.error(str(e))
+            try: st.json(S().git_client.call_tool_sync("git_branch", {"repo_path": repo}))
+            except Exception as e: st.error(str(e))
         commit_msg = q3.text_input("Commit msg", key="git_quick_commit_msg")
         if q4.button("Commit (staged)"):
             if commit_msg.strip():
                 try:
-                    st.json(
-                        S().git_client.call_tool_sync(
-                            "git_commit",
-                            {"repo_path": repo, "message": commit_msg.strip()},
-                        )
-                    )
+                    st.json(S().git_client.call_tool_sync("git_commit", {"repo_path": repo, "message": commit_msg.strip()}))
                     st.success("Commit realizado")
                 except Exception as e:
                     st.error(str(e))
